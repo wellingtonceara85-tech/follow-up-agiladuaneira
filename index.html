@@ -10,11 +10,11 @@
      FIREBASE — Auth + Firestore (tempo real, multiusuário)
 ═══════════════════════════════════════════════════════ -->
 <script type="module">
-import { initializeApp }    from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-import { getAuth, onAuthStateChanged, signOut }
-                             from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-import { getFirestore, collection, doc, onSnapshot, setDoc, deleteDoc }
-                             from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import { initializeApp }         from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, onAuthStateChanged, signOut, createUserWithEmailAndPassword }
+                                  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import { getFirestore, collection, doc, onSnapshot, setDoc, deleteDoc, getDoc, getDocs, writeBatch, query, where }
+                                  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
 const firebaseConfig = {
   apiKey:            "AIzaSyDAXMU7aK_PdlMfGdvjbG5zM8SuybVu1mc",
@@ -29,21 +29,147 @@ const app  = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db   = getFirestore(app);
 
-onAuthStateChanged(auth, user => {
-  if (!user) { window.location.href = "login.html"; return; }
+// ─── E-mails dos Administradores iniciais ─────────────────────
+const ADMIN_EMAILS = [
+  'wellington@agiladuaneira.com.br'
+];
+
+// ─── Estado global de identidade (populado no onAuthStateChanged) ─
+window._rbac = { uid: null, email: null, perfil: null, nome: null, isAdmin: false };
+
+// ─── Helpers RBAC expostos para o JS não-module ──────────────
+window._isAdmin = () => window._rbac.isAdmin;
+window._isFinanceiro = () => window._rbac.perfil === 'financeiro';
+window._getUID  = () => window._rbac.uid;
+
+// ─── Operações Firestore expostas para JS não-module ─────────
+window._fbSignOut    = () => signOut(auth).then(() => { window.location.href = "login.html"; });
+window._fbSaveProc   = p   => setDoc(doc(db, "processos", String(p.id)), p);
+window._fbDeleteProc = id  => deleteDoc(doc(db, "processos", String(id)));
+window._fbSaveUser   = u   => setDoc(doc(db, "usuarios", u.uid), u);
+
+// Retransferir importador: atualiza campo analistaUID em todos os processos do importador
+window._fbTransferImportador = async (nomeImportador, novoAnalistaUID, novoAnalistaNome) => {
+  const snap = await getDocs(query(collection(db, "processos"), where("cliente", "==", nomeImportador)));
+  if (snap.empty) {
+    // Nenhum processo no Firestore ainda — salva apenas no mapa local
+    return;
+  }
+  const batch = writeBatch(db);
+  snap.forEach(d => {
+    // Usa set com merge para não correr risco de falhar se o doc tiver estrutura diferente
+    batch.set(doc(db, "processos", d.id), { analistaUID: novoAnalistaUID, analistaNome: novoAnalistaNome }, { merge: true });
+  });
+  await batch.commit();
+};
+
+// Criar usuário via Firebase Auth (apenas Admin pode chamar)
+window._fbCreateUser = async (email, senha, nome, perfil) => {
+  // Cria uma segunda instância temporária para não deslogar o admin
+  const secondApp  = initializeApp(firebaseConfig, 'secondary_' + Date.now());
+  const secondAuth = getAuth(secondApp);
+  try {
+    const cred = await createUserWithEmailAndPassword(secondAuth, email, senha);
+    const uid  = cred.user.uid;
+    await setDoc(doc(db, "usuarios", uid), { uid, email, nome, perfil, ativo: true, criadoEm: new Date().toISOString() });
+    await secondAuth.signOut();
+    return { ok: true, uid };
+  } catch(e) {
+    return { ok: false, erro: e.message };
+  }
+};
+
+// ─── Carregar perfil do usuário logado ────────────────────────
+async function carregarPerfil(user) {
+  // Admin hard-coded por e-mail (garante acesso mesmo sem doc no Firestore)
+  const isAdminEmail = ADMIN_EMAILS.includes(user.email.toLowerCase());
+
+  let perfil = isAdminEmail ? 'admin' : 'analista';
+  let nome   = user.email;
+
+  // Tenta ler/criar doc na coleção usuarios
+  const uRef  = doc(db, "usuarios", user.uid);
+  const uSnap = await getDoc(uRef);
+
+  if (uSnap.exists()) {
+    const data = uSnap.data();
+    perfil = data.perfil || perfil;
+    nome   = data.nome   || nome;
+    if (!data.ativo) {
+      // Conta desativada
+      alert('Sua conta está desativada. Contate o administrador.');
+      signOut(auth); return;
+    }
+  } else if (isAdminEmail) {
+    // Cria doc automático para admin hard-coded na primeira vez
+    await setDoc(uRef, { uid: user.uid, email: user.email, nome: user.email, perfil: 'admin', ativo: true, criadoEm: new Date().toISOString() });
+  } else {
+    // Usuário existe no Auth mas sem doc → aguarda admin criar o perfil
+    alert('Usuário sem perfil configurado. Contate o administrador.');
+    signOut(auth); return;
+  }
+
+  window._rbac = { uid: user.uid, email: user.email, perfil, nome, isAdmin: perfil === 'admin' };
+
+  // Atualiza UI
   const el = document.getElementById("hdr-user");
-  if (el) el.textContent = user.email;
-  window._fbSignOut    = () => signOut(auth).then(() => { window.location.href = "login.html"; });
-  window._fbSaveProc   = p  => setDoc(doc(db, "processos", String(p.id)), p);
-  window._fbDeleteProc = id => deleteDoc(doc(db, "processos", String(id)));
-  onSnapshot(collection(db, "processos"), snap => {
+  if (el) {
+    const badge = window._rbac.isAdmin
+      ? '<span style="background:rgba(240,165,0,.25);color:#F0A500;border-radius:10px;padding:1px 7px;font-size:9px;font-weight:700;margin-left:4px">ADMIN</span>'
+      : window._isFinanceiro()
+      ? '<span style="background:rgba(27,138,90,.2);color:#1B8A5A;border-radius:10px;padding:1px 7px;font-size:9px;font-weight:700;margin-left:4px">FINANCEIRO</span>'
+      : '<span style="background:rgba(75,174,232,.2);color:#4BAEE8;border-radius:10px;padding:1px 7px;font-size:9px;font-weight:700;margin-left:4px">ANALISTA</span>';
+    el.innerHTML = nome + badge;
+  }
+
+  // Mostra/oculta botão Cadastros (só admin)
+  const btnCad = document.getElementById('btn-cadastros-hdr');
+  if (btnCad) btnCad.style.display = window._rbac.isAdmin ? '' : 'none';
+
+  // Financeiro: perfil de leitura — oculta criação de processo
+  const btnNovo = document.getElementById('btn-novo-processo');
+  if (btnNovo) btnNovo.style.display = window._isFinanceiro() ? 'none' : '';
+
+  // Filtro por Analista na toolbar — só Admin
+  const fAnalista = document.getElementById('f-analista');
+  if (fAnalista) fAnalista.style.display = window._rbac.isAdmin ? '' : 'none';
+
+  // Listener de processos — admin vê todos, analista só os seus, financeiro só os enviados p/ faturamento.
+  // IMPORTANTE: o Firestore nega a consulta inteira quando a regra de segurança depende de um
+  // campo do documento (analistaUID / envFaturamentoData) que a query não restringe via where() —
+  // por isso usamos query+where específico por perfil, em vez de ouvir a coleção inteira sem filtro.
+  const processosQuery = window._rbac.isAdmin
+    ? collection(db, "processos")
+    : window._rbac.perfil === 'financeiro'
+    ? query(collection(db, "processos"), where("envFaturamentoData", ">", ""))
+    : query(collection(db, "processos"), where("analistaUID", "==", window._rbac.uid));
+
+  onSnapshot(processosQuery, snap => {
     const fsProcs = [];
     snap.forEach(d => fsProcs.push(d.data()));
     fsProcs.sort((a, b) => (a.id || 0) - (b.id || 0));
     procs = fsProcs;
     if (procs.length) nextId = Math.max(...procs.map(p => p.id || 0)) + 1;
     populateSelects(); renderThead(); render();
+  }, err => console.error('Erro ao carregar processos:', err));
+
+  // Listener de usuários — todos os perfis carregam (necessário para selects
+  // de Analista Responsável, filtro por analista e painel de Cadastros)
+  onSnapshot(collection(db, "usuarios"), snap => {
+    window._allUsers = [];
+    snap.forEach(d => window._allUsers.push(d.data()));
+    populateSelects();
+    // Re-render do painel de usuários se estiver aberto
+    const cadPanel = document.getElementById('cad-panel');
+    if (cadPanel && cadPanel.classList.contains('open') && cadTab === 'usr') {
+      renderCadBody();
+    }
   });
+}
+
+onAuthStateChanged(auth, user => {
+  if (!user) { window.location.href = "login.html"; return; }
+  carregarPerfil(user);
 });
 </script>
 <style>
@@ -424,7 +550,7 @@ thead th .col-label { padding-left:4px; }
     </div>
   </div>
   <div style="display:flex;align-items:center;gap:10px">
-    <button class="btn-cadastros" onclick="openCadastros()">
+    <button class="btn-cadastros" id="btn-cadastros-hdr" onclick="openCadastros()" style="display:none">
       <svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
       Cadastros
     </button>
@@ -478,8 +604,9 @@ thead th .col-label { padding-left:4px; }
     <select class="fsel" id="f-canal"><option value="">Todos os canais</option><option>Verde</option><option>Amarelo</option><option>Vermelho</option></select>
     <select class="fsel" id="f-navio"><option value="">Todos os navios</option></select>
     <select class="fsel" id="f-cliente"><option value="">Todos os importadores</option></select>
+    <select class="fsel" id="f-analista" style="display:none"><option value="">Todos os analistas</option></select>
     <span class="tlbl" id="tlbl"></span>
-    <button class="btn-new" onclick="openNew()">
+    <button class="btn-new" id="btn-novo-processo" onclick="openNew()">
       <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
       Novo processo
     </button>
@@ -776,6 +903,15 @@ function populateSelects() {
   importadores.sort((a,b)=>a.nome.localeCompare(b.nome)).forEach(c => {
     cliSel.innerHTML += `<option value="${c.nome}">${c.nome}${c.cnpj?' — '+c.cnpj:''}</option>`;
   });
+
+  // Filtro por Analista (só Admin) — lista os analistas ativos
+  const anaSel = document.getElementById('f-analista');
+  if (anaSel) {
+    const curAna = anaSel.value;
+    anaSel.innerHTML = '<option value="">Todos os analistas</option>';
+    const analistas = (window._allUsers||[]).filter(u=>u.perfil==='analista').sort((a,b)=>(a.nome||'').localeCompare(b.nome||''));
+    analistas.forEach(u => { anaSel.innerHTML += `<option value="${u.uid}" ${u.uid===curAna?'selected':''}>${u.nome}</option>`; });
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -786,6 +922,8 @@ function filtered() {
   const fC  = document.getElementById('f-canal').value;
   const fN  = document.getElementById('f-navio').value;
   const fCl = document.getElementById('f-cliente').value;
+  const fAnaEl = document.getElementById('f-analista');
+  const fAna = fAnaEl ? fAnaEl.value : '';
   // Determine which modal label to filter by
   const modalLabel = currentModal === 'mar' ? 'Marítimo' : 'Aéreo';
   return procs.filter(p => {
@@ -799,6 +937,7 @@ function filtered() {
     if (fC && p.canal !== fC)    return false;
     if (fN && p.navio !== fN)    return false;
     if (fCl && p.cliente !== fCl) return false;
+    if (fAna && p.analistaUID !== fAna) return false;
     return true;
   });
 }
@@ -864,6 +1003,7 @@ function openDetail(id) {
     <div class="di"><div class="dl">Canal</div><div class="dv">${canalHTML(p.canal)}</div></div>
     <div class="di"><div class="dl">Produto</div><div class="dv">${fv(p.produto)}</div></div>
     <div class="di"><div class="dl">Regime ICMS</div><div class="dv">${fv(p.regimeICMS)}</div></div>
+    <div class="di"><div class="dl">Analista Responsável</div><div class="dv">${fv(p.analistaNome)}</div></div>
     <div class="di"><div class="dl">CIA / Armador</div><div class="dv">${fv(p.cia)} ${trackBtn}</div></div>
     <div class="di"><div class="dl">Nº DI/DUIMP</div><div class="dv">${fv(p.di)}</div></div>
     <div class="di"><div class="dl">Retificação DI</div><div class="dv">${fv(p.retifDI)}</div></div>
@@ -922,22 +1062,67 @@ function openDetail(id) {
     ${p.defLi?`<div class="di"><div class="dl">Deferimento LI/LPCO</div><div class="dv">${fv(p.defLi)}</div></div>`:''}
     ${p.solicDesova?`<div class="di"><div class="dl">Solic. Desova</div><div class="dv">${fv(p.solicDesova)}</div></div>`:''}
     ${p.desova?`<div class="di"><div class="dl">Data da Desova</div><div class="dv">${fv(p.desova)}</div></div>`:''}
+    <div class="di"><div class="dl">Envio p/ Faturamento</div><div class="dv">${fv(p.envFaturamentoData)}</div></div>
+    <div class="di"><div class="dl">Faturamento Realizado</div><div class="dv">${fv(p.dataFaturamentoData)}</div></div>
     ${p.obs?`<div class="di full"><div class="dl">Observações</div><div class="dv" style="font-size:12px;line-height:1.5">${p.obs}</div></div>`:''}
   </div>`;
 
-  const finBtn = p.finalizado
-    ? `<button class="btn-fin" onclick="toggleFin(${p.id})">↩ Reabrir</button>`
-    : `<button class="btn-fin" onclick="toggleFin(${p.id})">✓ Finalizar processo</button>`;
+  // Bloco de registro do Financeiro: única ação permitida a esse perfil —
+  // preencher a data de Faturamento Realizado, sem acesso ao form completo.
+  if (window._isFinanceiro()) {
+    document.getElementById('m-body').insertAdjacentHTML('beforeend', `
+      <div style="padding:1rem 1.25rem;border-top:1px solid var(--g100);background:var(--g50)">
+        <div class="dsec" style="border-bottom:none;padding-bottom:0">Financeiro — Registrar Faturamento</div>
+        <div style="display:flex;gap:8px;align-items:flex-end;margin-top:8px">
+          <div class="fg" style="margin:0;flex:1"><label>Faturamento Realizado</label>
+            <input id="f-fin-dataFaturamento" value="${p.dataFaturamentoData||''}" placeholder="dd/mm/aaaa">
+          </div>
+          <button class="btn-save" onclick="registrarFaturamento(${p.id})">💾 Registrar Faturamento</button>
+        </div>
+      </div>`);
+  }
+
+  const canEdit = window._isAdmin() || (p.analistaUID === window._rbac.uid);
+  const temEnvFaturamento = !!p.envFaturamentoData;
+  let finBtn = '';
+  if (p.finalizado) {
+    // Reabrir: só Admin, mesmo que o analista seja o responsável
+    if (window._isAdmin()) finBtn = `<button class="btn-fin" onclick="toggleFin(${p.id})">↩ Reabrir</button>`;
+  } else if (window._isAdmin()) {
+    finBtn = `<button class="btn-fin" onclick="toggleFin(${p.id})">✓ Finalizar processo</button>`;
+  } else if (canEdit && temEnvFaturamento) {
+    finBtn = `<button class="btn-fin" onclick="toggleFin(${p.id})">✓ Finalizar processo</button>`;
+  } else if (canEdit && !temEnvFaturamento) {
+    finBtn = `<button class="btn-fin" disabled style="opacity:.5;cursor:not-allowed" title="Só é possível finalizar após preencher 'Envio p/ Faturamento'.">✓ Finalizar processo</button>`;
+  }
   document.getElementById('m-foot').innerHTML =
     `<button class="btn-sec" onclick="closeModal()">Fechar</button>
      ${finBtn}
-     <button class="btn-edit" onclick="openEdit(${p.id})">✏ Editar</button>
-     <button class="btn-del" onclick="delProc(${p.id})">Excluir</button>`;
+     ${canEdit ? `<button class="btn-edit" onclick="openEdit(${p.id})">✏ Editar</button>` : ''}
+     ${window._isAdmin() ? `<button class="btn-del" onclick="delProc(${p.id})">Excluir</button>` : ''}`;
   openModal();
+}
+
+// Financeiro: registra a data de Faturamento Realizado direto, sem abrir o form completo
+function registrarFaturamento(id) {
+  const p = procs.find(x=>x.id===id); if(!p) return;
+  const val = (document.getElementById('f-fin-dataFaturamento').value || '').trim();
+  if (!val) { showToast('⚠ Informe a data do faturamento.'); return; }
+  p.dataFaturamentoData = val;
+  if (window._fbSaveProc) window._fbSaveProc(p);
+  closeModal(); render();
+  showToast('✓ Faturamento registrado!');
 }
 
 function toggleFin(id) {
   const p = procs.find(x=>x.id===id); if(!p) return;
+  // Guarda de segurança (replica a regra do botão, para bloquear chamadas via console)
+  if (p.finalizado && !window._isAdmin()) {
+    showToast('⚠ Só o Admin pode reabrir um processo finalizado.'); return;
+  }
+  if (!p.finalizado && !window._isAdmin() && !p.envFaturamentoData) {
+    showToast('⚠ Preencha "Envio p/ Faturamento" antes de finalizar.'); return;
+  }
   if (!p.finalizado && !confirm('Mover para "Processos Finalizados"?')) return;
   p.finalizado = !p.finalizado;
   if (window._fbSaveProc) window._fbSaveProc(p);
@@ -987,6 +1172,20 @@ function renderForm(p) {
         <option value="Marítimo" ${v('modalTransporte')==='Marítimo'||!v('modalTransporte')?'selected':''}>⚓ Marítimo</option>
         <option value="Aéreo"    ${v('modalTransporte')==='Aéreo'?'selected':''}>✈ Aéreo</option>
       </select></div>
+
+    ${(window._isAdmin() || !editingId) ? `
+    <div class="fg"><label>Analista Responsável</label>
+      <select id="f-analistaUID">
+        <option value="">— Sem analista atribuído —</option>
+        ${(window._allUsers||[]).filter(u=>u.ativo && u.perfil!=='financeiro').map(u =>
+          `<option value="${u.uid}" ${(v('analistaUID')===u.uid || (!editingId && !p && u.uid===window._rbac.uid))?'selected':''}>${u.nome} (${u.perfil})</option>`
+        ).join('')}
+      </select>
+    </div>` : `<div class="fg"><label>Analista Responsável</label>
+      <input value="${v('analistaNome')||window._rbac.nome||''}" disabled style="background:var(--g50);color:var(--g500)">
+      <div style="font-size:10px;color:var(--g400);margin-top:3px">Só o Admin pode alterar o responsável após a criação.</div>
+    </div>`}
+
     <div class="fg"><label>CIA / Armador</label>
       <div class="ac-wrap" id="cia-ac-wrap">
         <input id="f-cia" value="${v('cia')}" autocomplete="off" placeholder="MSC, CMA CGM, Hapag..."
@@ -1052,6 +1251,10 @@ function renderForm(p) {
     <div class="fg"><label>Deferimento LI/LPCO</label> <input id="f-defLi"     value="${v('defLi')}"       placeholder="dd/mm/aaaa"></div>
     <div class="fg"><label>Solic. Desova</label>      <input id="f-solicDesova" value="${v('solicDesova')}" placeholder="dd/mm/aaaa"></div>
     <div class="fg"><label>Data da Desova</label>     <input id="f-desova"      value="${v('desova')}"      placeholder="dd/mm/aaaa"></div>
+
+    <div class="fsec">Faturamento</div>
+    <div class="fg"><label>Envio p/ Faturamento</label> <input id="f-envFaturamentoData" value="${v('envFaturamentoData')}" placeholder="dd/mm/aaaa"></div>
+    <div class="fg"><label>Faturamento Realizado</label> <input id="f-dataFaturamentoData" value="${v('dataFaturamentoData')}" placeholder="dd/mm/aaaa"></div>
 
     ${customCols.length ? `
     <div class="fsec">Campos Personalizados</div>
@@ -1134,16 +1337,27 @@ function saveProc() {
     'recebProc','embarque','prevChegada','chegada','afrmm','presenca','scanner','mapaLib',
     'espNF','regDi','desembaraco','glmeEntr','glmeLib','daeICMS','compICMS',
     'recebNF','envNFSis','homSiscoex','averbacao',
-    'li','defLi','solicDesova','desova','obs'];
+    'li','defLi','solicDesova','desova','envFaturamentoData','dataFaturamentoData','obs'];
   const IDS  = ['f-refCli','f-refAgil','f-importador','f-cnpj','f-modalTransporte','f-cia','f-produto','f-regimeICMS',
     'f-canal2','f-di','f-consolidado','f-retifDI','f-navio2','f-pod','f-hbl','f-ceMercante','f-containers',
     'f-recebProc','f-embarque','f-prevChegada','f-chegada','f-afrmm','f-presenca','f-scanner','f-mapaLib',
     'f-espNF','f-regDi','f-desembaraco','f-glmeEntr','f-glmeLib','f-daeICMS','f-compICMS',
     'f-recebNF','f-envNFSis','f-homSiscoex','f-averbacao',
-    'f-li','f-defLi','f-solicDesova','f-desova','f-obs'];
+    'f-li','f-defLi','f-solicDesova','f-desova','f-envFaturamentoData','f-dataFaturamentoData','f-obs'];
 
   const obj = {};
   KEYS.forEach((k,i) => { const el=document.getElementById(IDS[i]); if(el) obj[k]=el.value.trim(); });
+
+  // Analista responsável — select existe quando Admin (sempre) ou quando é
+  // criação de processo novo (qualquer analista pode designar o responsável).
+  // Em edição por analista o select não existe no DOM, então o valor antigo
+  // do processo é preservado automaticamente (não sobrescrevemos obj.analistaUID).
+  const analistaEl = document.getElementById('f-analistaUID');
+  if (analistaEl) {
+    obj.analistaUID = analistaEl.value;
+    const u = (window._allUsers||[]).find(x => x.uid === analistaEl.value);
+    obj.analistaNome = u ? u.nome : '';
+  }
 
   // Campos personalizados (criados via "+ Adicionar Coluna")
   customCols.forEach(cc => {
@@ -1244,6 +1458,9 @@ function addArmador(nome) {
 }
 
 function openCadastros() {
+  // Mostra aba Usuários só para admin
+  const usrTab = document.getElementById('ct-usr');
+  if (usrTab) usrTab.style.display = window._isAdmin() ? '' : 'none';
   document.getElementById('cad-overlay').classList.add('open');
   document.getElementById('cad-panel').classList.add('open');
   renderCadBody();
@@ -1254,8 +1471,9 @@ function closeCadastros() {
 }
 function switchCadTab(t) {
   cadTab = t;
-  ['imp','nav','arm','reg','col'].forEach(id => {
-    document.getElementById('ct-'+id).classList.toggle('active', id===t);
+  ['imp','nav','arm','usr','reg','col'].forEach(id => {
+    const el = document.getElementById('ct-'+id);
+    if (el) el.classList.toggle('active', id===t);
   });
   renderCadBody();
 }
@@ -1263,36 +1481,109 @@ function switchCadTab(t) {
 function renderCadBody() {
   const body = document.getElementById('cad-body');
   if (cadTab === 'imp') {
+    const analistaOpts = (window._allUsers||[])
+      .filter(u => u.ativo && u.perfil!=='financeiro')
+      .map(u => `<option value="${u.uid}">${u.nome}</option>`).join('');
     body.innerHTML = `
       <p style="font-size:11px;color:var(--g400);margin-bottom:10px">
-        Cadastre aqui os importadores. Eles aparecerão como sugestão no campo "Importador" do processo.
+        Cadastre aqui os importadores e defina o analista responsável. Eles aparecerão como sugestão no
+        campo "Importador" do processo.<br>
+        <strong>Ao trocar o analista, todos os processos do importador migram automaticamente.</strong>
       </p>
       <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px">
-        <input id="cad-imp-nome" placeholder="Nome completo do importador..." 
+        <input id="cad-imp-nome" placeholder="Nome completo do importador..."
           style="width:100%;height:34px;padding:0 9px;border:1px solid var(--g200);border-radius:var(--r8);font-size:12px;outline:none"
           onkeydown="if(event.key==='Enter')document.getElementById('cad-imp-cnpj').focus()">
         <div style="display:flex;gap:8px">
-          <input id="cad-imp-cnpj" placeholder="CNPJ (opcional)" 
+          <input id="cad-imp-cnpj" placeholder="CNPJ (opcional)"
             style="flex:1;height:34px;padding:0 9px;border:1px solid var(--g200);border-radius:var(--r8);font-size:12px;outline:none"
             onkeydown="if(event.key==='Enter')cadAddImp()">
           <button class="btn-cad-add" onclick="cadAddImp()">+ Adicionar</button>
         </div>
+        ${analistaOpts ? `<select id="cad-imp-analista" style="height:34px;padding:0 10px;border:1px solid var(--g200);border-radius:var(--r8);font-size:12px;outline:none;background:#fff">
+          <option value="">— Sem analista —</option>
+          ${analistaOpts}
+        </select>` : '<p style="font-size:11px;color:var(--g400)">Cadastre usuários primeiro para vincular analistas.</p>'}
       </div>
       <div class="cad-list">
-        ${importadores.length ? importadores.map((imp,i) => `
-          <div class="cad-item" style="align-items:flex-start">
-            <div style="flex:1">
-              <div class="cad-item-name">${imp.nome}</div>
-              ${imp.cnpj
-                ? `<div class="cad-item-sub">CNPJ: ${imp.cnpj}
-                    <button onclick="cadEditCNPJ(${i})" style="margin-left:6px;font-size:10px;color:var(--blue);background:none;border:none;cursor:pointer;padding:0">✏ editar</button>
-                   </div>`
-                : `<div class="cad-item-sub" style="color:var(--amber)">CNPJ não informado
-                    <button onclick="cadEditCNPJ(${i})" style="margin-left:6px;font-size:10px;color:var(--blue);background:none;border:none;cursor:pointer;padding:0">+ informar</button>
-                   </div>`}
+        ${importadores.length ? importadores.map((imp,i) => {
+          const analistaOpts2 = window._isAdmin()
+            ? `<select onchange="transferirImportador(${i}, this)"
+                style="height:26px;padding:0 6px;border:1px solid var(--g200);border-radius:var(--r4);font-size:11px;outline:none;background:#fff;max-width:140px">
+                <option value="">— Sem analista —</option>
+                ${(window._allUsers||[]).filter(u=>u.ativo && u.perfil!=='financeiro').map(u =>
+                  `<option value="${u.uid}|${u.nome.replace(/"/g,'&quot;')}" ${imp.analistaUID===u.uid?'selected':''}>${u.nome}</option>`
+                ).join('')}
+              </select>` : `<span style="font-size:11px;color:var(--g600)">${imp.analistaNome || '<span style="color:var(--g300);font-style:italic">Sem analista</span>'}</span>`;
+          return `<div class="cad-item" style="flex-direction:column;align-items:flex-start;gap:6px">
+            <div style="display:flex;align-items:center;justify-content:space-between;width:100%">
+              <div style="flex:1">
+                <div class="cad-item-name">${imp.nome}</div>
+                ${imp.cnpj
+                  ? `<div class="cad-item-sub">CNPJ: ${imp.cnpj}
+                      <button onclick="cadEditCNPJ(${i})" style="margin-left:6px;font-size:10px;color:var(--blue);background:none;border:none;cursor:pointer;padding:0">✏ editar</button>
+                     </div>`
+                  : `<div class="cad-item-sub" style="color:var(--amber)">CNPJ não informado
+                      <button onclick="cadEditCNPJ(${i})" style="margin-left:6px;font-size:10px;color:var(--blue);background:none;border:none;cursor:pointer;padding:0">+ informar</button>
+                     </div>`}
+              </div>
+              <button class="btn-cad-del" onclick="cadDelImp(${i})" title="Remover">×</button>
             </div>
-            <button class="btn-cad-del" onclick="cadDelImp(${i})" title="Remover">×</button>
-          </div>`).join('') : '<div class="cad-empty">Nenhum importador cadastrado.<br>Adicione acima.</div>'}
+            <div style="display:flex;align-items:center;gap:8px">
+              <span style="font-size:10px;color:var(--g400);font-weight:600">ANALISTA:</span>
+              ${analistaOpts2}
+            </div>
+          </div>`;
+        }).join('') : '<div class="cad-empty">Nenhum importador cadastrado.<br>Adicione acima.</div>'}
+      </div>`;
+  } else if (cadTab === 'usr') {
+    // ── Usuários (só Admin) ──────────────────────────────────────
+    const users = window._allUsers || [];
+    body.innerHTML = `
+      <p style="font-size:11px;color:var(--g400);margin-bottom:12px;line-height:1.6">
+        Crie e gerencie os usuários do sistema.<br>
+        Perfis disponíveis: <strong>Analista</strong> (acesso restrito aos próprios clientes),
+        <strong>Administrador</strong> (acesso total) e <strong>Financeiro</strong>
+        (visualiza só os processos a partir do "Envio p/ Faturamento" e registra a data de Faturamento Realizado).
+      </p>
+
+      <div style="background:var(--pale);border:1px solid var(--blue);border-radius:var(--r8);padding:12px;margin-bottom:14px">
+        <div style="font-size:11px;font-weight:700;color:var(--navy);margin-bottom:10px">+ Novo Usuário</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <input id="nu-nome"  placeholder="Nome completo" style="height:30px;padding:0 9px;border:1px solid var(--g200);border-radius:var(--r4);font-size:12px;outline:none">
+          <input id="nu-email" placeholder="E-mail" type="email" style="height:30px;padding:0 9px;border:1px solid var(--g200);border-radius:var(--r4);font-size:12px;outline:none">
+          <input id="nu-senha" placeholder="Senha (mín. 6 caracteres)" type="password" style="height:30px;padding:0 9px;border:1px solid var(--g200);border-radius:var(--r4);font-size:12px;outline:none">
+          <select id="nu-perfil" style="height:30px;padding:0 9px;border:1px solid var(--g200);border-radius:var(--r4);font-size:12px;outline:none;background:#fff">
+            <option value="analista">Analista</option>
+            <option value="admin">Administrador</option>
+            <option value="financeiro">Financeiro</option>
+          </select>
+          <button onclick="criarUsuario()"
+            style="height:32px;background:var(--navy);color:#fff;border:none;border-radius:var(--r8);font-size:12px;font-weight:600;cursor:pointer">
+            + Criar Usuário
+          </button>
+        </div>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:8px">
+        ${users.length ? users.map(u => `
+          <div style="background:var(--g50);border:1px solid var(--g200);border-radius:var(--r8);padding:10px 12px">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+              <div>
+                <span style="font-size:13px;font-weight:600;color:var(--navy)">${u.nome}</span>
+                <span style="margin-left:6px;font-size:10px;padding:1px 7px;border-radius:10px;font-weight:700;
+                  background:${u.perfil==='admin'?'rgba(240,165,0,.2)':u.perfil==='financeiro'?'rgba(27,138,90,.2)':'rgba(75,174,232,.15)'};
+                  color:${u.perfil==='admin'?'#856404':u.perfil==='financeiro'?'#1B8A5A':'#1A5276'}">${u.perfil==='admin'?'ADMIN':u.perfil==='financeiro'?'FINANCEIRO':'ANALISTA'}</span>
+                ${!u.ativo?'<span style="margin-left:4px;font-size:10px;padding:1px 7px;border-radius:10px;font-weight:700;background:var(--rbg);color:var(--red)">INATIVO</span>':''}
+              </div>
+              <div style="display:flex;gap:4px">
+                <button onclick="toggleUserAtivo('${u.uid}', ${!u.ativo})"
+                  style="height:24px;padding:0 8px;border:1px solid var(--g200);background:#fff;border-radius:var(--r4);font-size:10px;font-weight:600;cursor:pointer;color:${u.ativo?'var(--red)':'var(--green)'}"
+                  title="${u.ativo?'Desativar':'Ativar'}">${u.ativo?'Desativar':'Ativar'}</button>
+              </div>
+            </div>
+            <div style="font-size:11px;color:var(--g400)">${u.email}</div>
+          </div>`).join('') : '<div class="cad-empty">Nenhum usuário cadastrado ainda.</div>'}
       </div>`;
   } else if (cadTab === 'nav') {
     body.innerHTML = `
@@ -1389,6 +1680,12 @@ function cadAddImp() {
   // Mesmo nome + CNPJ diferente → filial, permitir
   const sameNameDiff = importadores.find(i => i.nome.toLowerCase() === nome.toLowerCase());
   addImportador(nome, cnpj);
+  const analistaEl = document.getElementById('cad-imp-analista');
+  if (analistaEl && analistaEl.value) {
+    const u = (window._allUsers||[]).find(x => x.uid === analistaEl.value);
+    const novo = importadores.find(i => i.nome.toLowerCase() === nome.toLowerCase() && i.cnpj === cnpj);
+    if (novo && u) { novo.analistaUID = u.uid; novo.analistaNome = u.nome; saveImportadores(); }
+  }
   nomeEl.value = ''; cnpjEl.value = '';
   renderCadBody(); populateSelects();
   showToast(sameNameDiff ? '✓ Filial adicionada! (' + nome + ')' : '✓ Importador adicionado!');
@@ -1397,6 +1694,50 @@ function cadDelImp(i) {
   if (!confirm('Remover "' + importadores[i].nome + '" da lista?')) return;
   importadores.splice(i,1); saveImportadores();
   renderCadBody(); populateSelects(); showToast('Importador removido.');
+}
+
+// ── Criar usuário (Admin) ────────────────────────────────────
+async function criarUsuario() {
+  const nome  = (document.getElementById('nu-nome').value||'').trim();
+  const email = (document.getElementById('nu-email').value||'').trim();
+  const senha = (document.getElementById('nu-senha').value||'').trim();
+  const perfil = document.getElementById('nu-perfil').value;
+
+  if (!nome || !email || !senha) { showToast('⚠ Preencha nome, e-mail e senha.'); return; }
+  if (senha.length < 6) { showToast('⚠ Senha deve ter no mínimo 6 caracteres.'); return; }
+
+  showToast('Criando usuário...');
+  const res = await window._fbCreateUser(email, senha, nome, perfil);
+  if (res.ok) {
+    showToast('✓ Usuário criado com sucesso!');
+    renderCadBody();
+  } else {
+    showToast('Erro: ' + res.erro);
+  }
+}
+
+// ── Ativar/Desativar usuário ─────────────────────────────────
+async function toggleUserAtivo(uid, novoEstado) {
+  const acao = novoEstado ? 'ativar' : 'desativar';
+  if (!confirm(`${acao.charAt(0).toUpperCase()+acao.slice(1)} este usuário?`)) return;
+  await window._fbSaveUser({ ...(window._allUsers||[]).find(u=>u.uid===uid)||{uid}, ativo: novoEstado });
+  showToast(`✓ Usuário ${novoEstado?'ativado':'desativado'}.`);
+}
+
+// ── Transferir importador para novo analista ─────────────────
+async function transferirImportador(i, selectEl) {
+  const val = selectEl.value; // "uid|nome"
+  const imp = importadores[i]; if (!imp) return;
+  if (!val) {
+    imp.analistaUID = ''; imp.analistaNome = '';
+  } else {
+    const [uid, nome] = val.split('|');
+    imp.analistaUID = uid; imp.analistaNome = nome;
+  }
+  saveImportadores();
+  if (window._fbTransferImportador) await window._fbTransferImportador(imp.nome, imp.analistaUID, imp.analistaNome);
+  showToast('✓ Analista atualizado! Processos existentes migrados.');
+  renderCadBody();
 }
 function cadAddNav() {
   const inp = document.getElementById('cad-nav-input');
@@ -1771,6 +2112,9 @@ const ALL_COLS = [
   { id:'icms',      label:'Tipo ICMS',      render: p=>`<td style="font-size:11px">${p.regimeICMS||'—'}</td>` },
   { id:'cia',       label:'CIA',            render: p=>`<td>${p.cia||'—'}</td>` },
   { id:'progresso', label:'Progresso',      render: p=>`<td>${pgHTML(p)}</td>` },
+  { id:'analista',  label:'Analista Resp.', render: p=>`<td style="font-size:11px">${p.analistaNome||'—'}</td>` },
+  { id:'envFat',    label:'Env. Faturamento', render: p=>`<td>${p.envFaturamentoData||'—'}</td>` },
+  { id:'dataFat',   label:'Faturamento Realizado', render: p=>`<td>${p.dataFaturamentoData||'—'}</td>` },
   { id:'obs',       label:'Observações',    render: p=>`<td style="max-width:160px;font-size:11px;color:var(--g600);white-space:normal;line-height:1.4">${p.obs||''}</td>` },
 ];
 
@@ -2075,7 +2419,7 @@ document.getElementById('hdr-date').textContent =
   'Atualizado em ' + now.toLocaleDateString('pt-BR') + ' ' +
   now.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
 
-['srch','f-canal','f-navio','f-cliente'].forEach(id => {
+['srch','f-canal','f-navio','f-cliente','f-analista'].forEach(id => {
   const el = document.getElementById(id);
   el.addEventListener('input',  render);
   el.addEventListener('change', render);
@@ -2099,6 +2443,7 @@ load(); loadCadastros(); loadStatusRules(); loadCustomCols(); loadCols(); loadHi
     <button class="cad-tab active" id="ct-imp" onclick="switchCadTab('imp')">🏢 Importadores</button>
     <button class="cad-tab" id="ct-nav" onclick="switchCadTab('nav')">🚢 Navios</button>
     <button class="cad-tab" id="ct-arm" onclick="switchCadTab('arm')">⚓ CIA</button>
+    <button class="cad-tab" id="ct-usr" onclick="switchCadTab('usr')" style="display:none">👥 Usuários</button>
     <button class="cad-tab" id="ct-reg" onclick="switchCadTab('reg')">⚙ Regras</button>
     <button class="cad-tab" id="ct-col" onclick="switchCadTab('col')">📋 Colunas</button>
   </div>
