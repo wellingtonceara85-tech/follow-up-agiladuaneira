@@ -288,6 +288,9 @@ tbody tr:last-child{border-bottom:none}
 tbody tr:hover{background:var(--pale)}
 td{padding:9px 12px;white-space:nowrap;vertical-align:middle;border-right:1px solid var(--g100)}
 td:last-child{border-right:none}
+thead th:first-child{position:sticky;left:0;z-index:65}
+tbody td:first-child{position:sticky;left:0;z-index:40;background:#fff}
+tbody tr:hover td:first-child{background:var(--pale)}
 
 /* STATUS BADGES */
 .stb{display:inline-flex;align-items:center;gap:4px;border-radius:20px;padding:3px 9px;font-size:10px;font-weight:700;white-space:nowrap}
@@ -1150,6 +1153,8 @@ function renderForm(p) {
   const v = k => p ? (p[k]||'') : '';
   const impOptions = importadores.map(i =>
     `<option value="${i.nome}" ${v('cliente')===i.nome?'selected':''}>${i.nome}${i.cnpj?' — '+i.cnpj:''}</option>`).join('');
+  const impCnpjFallback = importadores.find(i => i.nome === v('cliente'));
+  const cnpjVal = v('cnpj') || (impCnpjFallback && impCnpjFallback.cnpj) || '';
 
   document.getElementById('m-body').innerHTML = `<div class="fgrid">
     <div class="fsec">Identificação</div>
@@ -1158,7 +1163,7 @@ function renderForm(p) {
 
     <div class="fg full"><label>Importador</label>
       <div class="ac-wrap">
-        <input id="f-importador" value="${v('cliente')}" autocomplete="off" placeholder="Digite ou selecione..." oninput="acFilter()" onfocus="acFilter()">
+        <input id="f-importador" value="${v('cliente')}" autocomplete="off" placeholder="Digite ou selecione..." oninput="acFilter()" onfocus="acFilter()" onblur="acCnpjFill()">
         <div class="ac-list" id="ac-list">
           ${impOptions}
           ${importadores.length?'<div class="ac-item" style="color:var(--g400);font-style:italic" onclick="acClose()">── Digitar novo importador ──</div>':''}
@@ -1166,7 +1171,7 @@ function renderForm(p) {
       </div>
     </div>
 
-    <div class="fg"><label>CNPJ</label><input id="f-cnpj" value="${v('cnpj')}"></div>
+    <div class="fg"><label>CNPJ</label><input id="f-cnpj" value="${cnpjVal}"></div>
     <div class="fg"><label>Modal</label>
       <select id="f-modalTransporte">
         <option value="Marítimo" ${v('modalTransporte')==='Marítimo'||!v('modalTransporte')?'selected':''}>⚓ Marítimo</option>
@@ -1311,6 +1316,14 @@ function acSelect(val) {
   const cnpjEl = document.getElementById('f-cnpj');
   if (imp && cnpjEl) { cnpjEl.value = imp.cnpj || ''; }
   acClose();
+}
+// Preenche CNPJ automaticamente quando o importador é digitado (sem clicar na lista)
+function acCnpjFill() {
+  const input = document.getElementById('f-importador');
+  const cnpjEl = document.getElementById('f-cnpj');
+  if (!input || !cnpjEl) return;
+  const imp = importadores.find(i => i.nome === input.value);
+  if (imp && imp.cnpj) { cnpjEl.value = imp.cnpj; }
 }
 function acClose() {
   const list = document.getElementById('ac-list');
@@ -2115,7 +2128,7 @@ const ALL_COLS = [
   { id:'analista',  label:'Analista Resp.', render: p=>`<td style="font-size:11px">${p.analistaNome||'—'}</td>` },
   { id:'envFat',    label:'Env. Faturamento', render: p=>`<td>${p.envFaturamentoData||'—'}</td>` },
   { id:'dataFat',   label:'Faturamento Realizado', render: p=>`<td>${p.dataFaturamentoData||'—'}</td>` },
-  { id:'obs',       label:'Observações',    render: p=>`<td style="max-width:160px;font-size:11px;color:var(--g600);white-space:normal;line-height:1.4">${p.obs||''}</td>` },
+  { id:'obs',       label:'Observações',    render: p=>`<td style="max-width:160px;font-size:11px;color:var(--g600);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${(p.obs||'').replace(/"/g,'&quot;')}">${p.obs||''}</td>` },
 ];
 
 // Default column order (by id)
@@ -2424,10 +2437,19 @@ document.getElementById('hdr-date').textContent =
   el.addEventListener('input',  render);
   el.addEventListener('change', render);
 });
-document.getElementById('overlay').addEventListener('click', e => {
-  if (e.target===document.getElementById('overlay')) closeModal();
+// Modal de Editar só fecha pelo (X), "Cancelar" ou "Salvar processo" — clique fora não fecha
+document.addEventListener('keydown', e => { if(e.key==='Escape') closePanel(); });
+
+// Máscara automática dd/mm/aaaa nos campos de data
+document.addEventListener('input', e => {
+  const el = e.target;
+  if (el.tagName === 'INPUT' && el.getAttribute('placeholder') === 'dd/mm/aaaa') {
+    const d = el.value.replace(/\D/g,'').slice(0,8);
+    el.value = d.length > 4 ? d.slice(0,2)+'/'+d.slice(2,4)+'/'+d.slice(4)
+              : d.length > 2 ? d.slice(0,2)+'/'+d.slice(2)
+              : d;
+  }
 });
-document.addEventListener('keydown', e => { if(e.key==='Escape') { closeModal(); closePanel(); } });
 
 load(); loadCadastros(); loadStatusRules(); loadCustomCols(); loadCols(); loadHiddenCols(); populateSelects(); renderThead(); render();
 </script>
